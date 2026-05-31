@@ -1,0 +1,24 @@
+{
+  "admin": {
+    "START": {
+      "amount": 88888888777,
+      "created": "2026-05-31"
+    },
+    "TEST": {
+      "amount": 999999999999,
+      "created": "2026-05-31"
+    }
+  },
+  "user": {
+    "АСКО": {
+      "creator_id": "8314370270",
+      "activations": 0,
+      "activated_by": []
+    },
+    "HELLO": {
+      "creator_id": "8144110555",
+      "activations": 0,
+      "activated_by": []
+    }
+  }
+}
