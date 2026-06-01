@@ -170,6 +170,29 @@ def add_log(db, uid, action, detail=""):
                      "action": action, "detail": detail})
     db[uid]["user_logs"] = logs[:30]
 
+# FIX: атомарное применение изменений к балансу / стате.
+# Решает lost-update: между load_db() и save_db() мог быть await,
+# во время которого другая операция изменила db. Эта функция
+# перечитывает db и применяет дельту, а не сохраняет устаревший снимок.
+def apply_balance_delta(uid, delta_balance=0, delta_wins=0, delta_losses=0,
+                        delta_draws=0, log_action=None, log_detail=""):
+    db = load_db()
+    if uid not in db:
+        return None
+    u = db[uid]
+    u["balance"] = max(0, int(u.get("balance", 0)) + int(delta_balance))
+    if delta_wins:
+        u["stats"]["wins"] = u["stats"].get("wins", 0) + int(delta_wins)
+    if delta_losses:
+        u["stats"]["losses"] = u["stats"].get("losses", 0) + int(delta_losses)
+    if delta_draws:
+        u["stats"].setdefault("draws", 0)
+        u["stats"]["draws"] = u["stats"].get("draws", 0) + int(delta_draws)
+    if log_action:
+        add_log(db, uid, log_action, log_detail)
+    save_db(db)
+    return u["balance"]
+
 # ─── PROMOS DB ──────────────────────────────────────────────────────────────
 def load_promos():
     if os.path.exists(PROMO_FILE):
@@ -307,8 +330,8 @@ sessions = {}
 captcha_data = {}
 
 # ─── LIMITS / ECONOMY ───────────────────────────────────────────────────────
-CUSTOM_BET_MAX = 1_500_000
-DUEL_MAX_BET = 50_000_000
+CUSTOM_BET_MAX = 100_000_000
+DUEL_MAX_BET = 100_000_000
 PROMO_USER_REWARD = 10_000_000
 PROMO_CREATOR_REWARD = 500_000
 SHOP_RATE_PER_STAR = 1_500_000
@@ -503,7 +526,7 @@ def game_nav_kb(cb):
         [btn("🏠  Меню", "main_menu", icon=EI_STAR)])
 
 def bet_kb(game):
-    bets = [100_000, 250_000, 500_000, 1_000_000, CUSTOM_BET_MAX]
+    bets = [100_000, 1_000_000, 10_000_000, 50_000_000, CUSTOM_BET_MAX]
     rows = []
     for i in range(0, len(bets), 2):
         row = [btn(f"💵 {fmt(bets[j])}", f"bet_{game}_{bets[j]}",
@@ -644,30 +667,49 @@ async def cmd_bal_text(msg: Message):
     await send_msg(msg.chat.id, f"💰 <b>Баланс:</b> <code>{fmt(user['balance'])}</code>")
 
 # ─── /pay ───────────────────────────────────────────────────────────────────
+_pay_locks = set()
+
 async def do_pay(src, db, uid, target_id, amount):
-    user = db[uid]
-    if not can_transfer(user): return False, "❌ Лимит 2 перевода/день!"
-    if target_id == uid: return False, "❌ Нельзя себе!"
-    if target_id not in db or not db[target_id].get("verified"): return False, "❌ Не найден!"
-    if db[target_id].get("banned"): return False, "❌ Заблокирован!"
-    if user["balance"] < amount: return False, f"❌ Мало средств!\nБаланс: <code>{fmt(user['balance'])}</code>"
-    received = int(amount * 0.8); commission = amount - received
-    user["balance"] -= amount; db[target_id]["balance"] += received
-    did_transfer(user)
-    tname = db[target_id].get("name", "Игрок")
-    add_log(db, uid, "transfer", f"-{fmt(amount)} → {safe(tname)}")
-    add_log(db, target_id, "transfer_in", f"+{fmt(received)} ← {safe(src.from_user.first_name)}")
+    # FIX: глобальный лок на пару (uid, target_id), чтоб двойной клик не задвоил перевод
+    lock_key = f"{uid}->{target_id}"
+    if uid in _pay_locks or lock_key in _pay_locks:
+        return False, "⏳ Подожди, перевод обрабатывается..."
+    _pay_locks.add(uid); _pay_locks.add(lock_key)
     try:
-        await send_msg(int(target_id),
-            f"💸 <b>Перевод!</b>\n\nОт: <b>{safe(src.from_user.first_name)}</b>\n"
-            f"💰 +<code>{fmt(received)}</code>\n\nБаланс: <code>{fmt(db[target_id]['balance'])}</code>")
-    except: pass
-    return True, (
-        f"✅ <b>Перевод!</b>\n\n👤 <b>{safe(tname)}</b>\n"
-        f"💰 Отправлено: <code>{fmt(amount)}</code>\n"
-        f"📊 Комиссия: <code>{fmt(commission)}</code>\n"
-        f"📬 Доставлено: <code>{fmt(received)}</code>\n\n"
-        f"Баланс: <code>{fmt(user['balance'])}</code>")
+        # перечитываем db, чтобы видеть актуальное состояние
+        db = load_db()
+        if uid not in db: return False, "❌ Аккаунт не найден"
+        user = db[uid]
+        if not can_transfer(user): return False, "❌ Лимит 2 перевода/день!"
+        if target_id == uid: return False, "❌ Нельзя себе!"
+        if target_id not in db or not db[target_id].get("verified"): return False, "❌ Не найден!"
+        if db[target_id].get("banned"): return False, "❌ Заблокирован!"
+        if user["balance"] < amount: return False, f"❌ Мало средств!\nБаланс: <code>{fmt(user['balance'])}</code>"
+        received = int(amount * 0.8); commission = amount - received
+
+        # FIX: атомарно изменяем оба баланса в одной транзакции (один save_db)
+        user["balance"] -= amount
+        db[target_id]["balance"] += received
+        did_transfer(user)
+        tname = db[target_id].get("name", "Игрок")
+        add_log(db, uid, "transfer", f"-{fmt(amount)} → {safe(tname)}")
+        add_log(db, target_id, "transfer_in", f"+{fmt(received)} ← {safe(src.from_user.first_name)}")
+        save_db(db)  # сохраняем СРАЗУ, до любого await
+
+        # Теперь, когда деньги уже в файле, можно безопасно слать уведомление
+        try:
+            await send_msg(int(target_id),
+                f"💸 <b>Перевод!</b>\n\nОт: <b>{safe(src.from_user.first_name)}</b>\n"
+                f"💰 +<code>{fmt(received)}</code>\n\nБаланс: <code>{fmt(db[target_id]['balance'])}</code>")
+        except: pass
+        return True, (
+            f"✅ <b>Перевод!</b>\n\n👤 <b>{safe(tname)}</b>\n"
+            f"💰 Отправлено: <code>{fmt(amount)}</code>\n"
+            f"📊 Комиссия: <code>{fmt(commission)}</code>\n"
+            f"📬 Доставлено: <code>{fmt(received)}</code>\n\n"
+            f"Баланс: <code>{fmt(user['balance'])}</code>")
+    finally:
+        _pay_locks.discard(uid); _pay_locks.discard(lock_key)
 
 @dp.message(Command("pay"))
 async def cmd_pay(msg: Message, state: FSMContext):
@@ -685,7 +727,7 @@ async def cmd_pay(msg: Message, state: FSMContext):
         if not tid.isdigit(): await send_msg(msg.chat.id, "❌ ID — число!"); return
         db = load_db()
         ok, text = await do_pay(msg, db, uid, tid, amount)
-        if ok: save_db(db)
+        # save_db больше не нужен — do_pay сохраняет атомарно внутри
         await send_msg(msg.chat.id, text); return
 
     if len(parts) == 2 and msg.reply_to_message:
@@ -694,7 +736,7 @@ async def cmd_pay(msg: Message, state: FSMContext):
         tid = str(msg.reply_to_message.from_user.id)
         db = load_db()
         ok, text = await do_pay(msg, db, uid, tid, amount)
-        if ok: save_db(db)
+        # save_db больше не нужен — do_pay сохраняет атомарно внутри
         await send_msg(msg.chat.id, text); return
 
     await state.set_state(PayStates.waiting_id)
@@ -728,7 +770,7 @@ async def pay_amount(msg: Message, state: FSMContext):
     db = load_db(); uid = str(msg.from_user.id)
     ok, text = await do_pay(msg, db, uid, rid, amount)
     await state.clear()
-    if ok: save_db(db)
+    # save_db больше не нужен — do_pay сохраняет атомарно внутри
     await send_msg(msg.chat.id, text, back_kb() if ok else None)
 
 # ─── /duel ──────────────────────────────────────────────────────────────────
@@ -1132,6 +1174,8 @@ async def cat_businesses_cb(cb: CallbackQuery):
         businesses_text(uid), businesses_kb(uid))
     await cb.answer()
 
+_biz_buy_locks = set()
+
 @dp.callback_query(F.data.startswith("biz_buy_sale_"))
 @dp.callback_query(F.data.startswith("biz_buy_"))
 async def business_buy_cb(cb: CallbackQuery):
@@ -1140,50 +1184,69 @@ async def business_buy_cb(cb: CallbackQuery):
     key = cb.data[len("biz_buy_sale_"):] if is_sale else cb.data[len("biz_buy_"):]
     if key not in BUSINESSES:
         await cb.answer("Бизнес не найден!", show_alert=True); return
-    data = load_businesses(); rec = data[key]; cfg = BUSINESSES[key]
-    owned_key = user_business_key(data, uid)
-    if owned_key:
-        await cb.answer(f"❌ У тебя уже есть бизнес: {BUSINESSES[owned_key]['name']}", show_alert=True); return
 
-    if not is_sale and key == "casino":
-        if rec.get("owner_id"):
-            await cb.answer("Казино уже куплено!", show_alert=True); return
-        await cb.answer()
-        r = await send_business_stars_invoice(cb.message.chat.id, key)
-        if not r.get("ok"):
-            await send_msg(cb.message.chat.id, "❌ Не удалось создать счёт Stars.", back_kb())
-        return
+    # FIX: глобальный лок на бизнес — двое одновременно не купят
+    lock_key = f"biz:{key}"
+    if lock_key in _biz_buy_locks:
+        await cb.answer("⏳ Кто-то прямо сейчас покупает этот бизнес...", show_alert=True); return
+    # FIX: персональный лок — двойной клик одного юзера не задвоит покупку
+    if f"user:{uid}" in _biz_buy_locks:
+        await cb.answer("⏳ Подожди...", show_alert=True); return
 
-    if is_sale:
-        price = int(rec.get("sale_price") or 0)
-        seller_id = rec.get("owner_id")
-        if not price or not seller_id:
-            await cb.answer("Бизнес уже не продаётся!", show_alert=True); return
-        if seller_id == uid:
-            await cb.answer("Нельзя купить свой бизнес!", show_alert=True); return
-    else:
-        if rec.get("owner_id"):
-            await cb.answer("Бизнес уже куплен!", show_alert=True); return
-        price = int(cfg.get("price", 0)); seller_id = None
+    _biz_buy_locks.add(lock_key); _biz_buy_locks.add(f"user:{uid}")
+    try:
+        data = load_businesses(); rec = data[key]; cfg = BUSINESSES[key]
+        owned_key = user_business_key(data, uid)
+        if owned_key:
+            await cb.answer(f"❌ У тебя уже есть бизнес: {BUSINESSES[owned_key]['name']}", show_alert=True); return
 
-    db = load_db(); user = get_user(db, uid, cb.from_user.first_name, cb.from_user.username or "")
-    if user["balance"] < price:
-        await cb.answer("Недостаточно средств!", show_alert=True); return
-    user["balance"] -= price
-    if seller_id and seller_id in db:
-        db[seller_id]["balance"] += price
-        add_log(db, seller_id, "business_sale", f"+{fmt(price)} ({cfg['name']})")
-    add_log(db, uid, "business_buy", f"-{fmt(price)} ({cfg['name']})")
-    rec["owner_id"] = uid
-    rec["owner_name"] = cb.from_user.first_name or "Игрок"
-    rec["last_claim"] = int(time.time())
-    rec["balance"] = 0
-    rec["sale_price"] = None
-    save_db(db); save_businesses(data)
-    await edit_msg(cb.message.chat.id, cb.message.message_id,
-        f"✅ <b>Бизнес куплен!</b>\n\n🏢 <b>{cfg['name']}</b>\n💰 Цена: <code>{fmt(price)}</code>",
-        businesses_kb(uid))
-    await cb.answer("✅ Куплено!")
+        if not is_sale and key == "casino":
+            if rec.get("owner_id"):
+                await cb.answer("Казино уже куплено!", show_alert=True); return
+            await cb.answer()
+            r = await send_business_stars_invoice(cb.message.chat.id, key)
+            if not r.get("ok"):
+                await send_msg(cb.message.chat.id, "❌ Не удалось создать счёт Stars.", back_kb())
+            return
+
+        if is_sale:
+            price = int(rec.get("sale_price") or 0)
+            seller_id = rec.get("owner_id")
+            if not price or not seller_id:
+                await cb.answer("Бизнес уже не продаётся!", show_alert=True); return
+            if seller_id == uid:
+                await cb.answer("Нельзя купить свой бизнес!", show_alert=True); return
+        else:
+            if rec.get("owner_id"):
+                await cb.answer("Бизнес уже куплен!", show_alert=True); return
+            price = int(cfg.get("price", 0)); seller_id = None
+
+        # Проверка баланса покупателя
+        db = load_db(); user = get_user(db, uid, cb.from_user.first_name, cb.from_user.username or "")
+        if user["balance"] < price:
+            await cb.answer("Недостаточно средств!", show_alert=True); return
+
+        # FIX: атомарно списываем у покупателя
+        apply_balance_delta(uid, delta_balance=-price,
+            log_action="business_buy", log_detail=f"-{fmt(price)} ({cfg['name']})")
+        # FIX: атомарно зачисляем продавцу (если есть)
+        if seller_id:
+            apply_balance_delta(seller_id, delta_balance=price,
+                log_action="business_sale", log_detail=f"+{fmt(price)} ({cfg['name']})")
+
+        # Обновляем бизнес — теперь данные о владельце
+        rec["owner_id"] = uid
+        rec["owner_name"] = cb.from_user.first_name or "Игрок"
+        rec["last_claim"] = int(time.time())
+        rec["balance"] = 0
+        rec["sale_price"] = None
+        save_businesses(data)
+        await edit_msg(cb.message.chat.id, cb.message.message_id,
+            f"✅ <b>Бизнес куплен!</b>\n\n🏢 <b>{cfg['name']}</b>\n💰 Цена: <code>{fmt(price)}</code>",
+            businesses_kb(uid))
+        await cb.answer("✅ Куплено!")
+    finally:
+        _biz_buy_locks.discard(lock_key); _biz_buy_locks.discard(f"user:{uid}")
 
 _biz_claim_locks = set()
 
@@ -1204,18 +1267,21 @@ async def business_claim_cb(cb: CallbackQuery):
         pending, hours = business_pending_income(key, rec)
         if pending <= 0:
             await cb.answer("Дохода пока нет!", show_alert=True); return
-        db = load_db(); user = get_user(db, uid, cb.from_user.first_name, cb.from_user.username or "")
-        user["balance"] += pending
-        add_log(db, uid, "business_claim", f"+{fmt(pending)} ({BUSINESSES[key]['name']})")
+        # FIX: сначала обнуляем счётчик в бизнесе (чтоб не задвоить если apply_balance_delta долгий),
+        # потом начисляем — если что-то упадёт, юзер потеряет немного дохода, но не получит дважды
         rec["balance"] = 0
         rec["last_claim"] = int(time.time())
-        save_db(db); save_businesses(data)
+        save_businesses(data)
+        new_bal = apply_balance_delta(uid, delta_balance=pending,
+            log_action="business_claim", log_detail=f"+{fmt(pending)} ({BUSINESSES[key]['name']})")
         await edit_msg(cb.message.chat.id, cb.message.message_id,
-            f"✅ <b>Доход забран!</b>\n\n🏢 <b>{BUSINESSES[key]['name']}</b>\n💰 +<code>{fmt(pending)}</code>\n\nБаланс: <code>{fmt(user['balance'])}</code>",
+            f"✅ <b>Доход забран!</b>\n\n🏢 <b>{BUSINESSES[key]['name']}</b>\n💰 +<code>{fmt(pending)}</code>\n\nБаланс: <code>{fmt(new_bal)}</code>",
             businesses_kb(uid))
         await cb.answer("✅ Зачислено!")
     finally:
         _biz_claim_locks.discard(lock_key)
+
+_biz_sell_state_locks = set()
 
 @dp.callback_query(F.data.startswith("biz_sell_state_"))
 async def business_sell_state_cb(cb: CallbackQuery):
@@ -1223,24 +1289,31 @@ async def business_sell_state_cb(cb: CallbackQuery):
     key = cb.data[len("biz_sell_state_"):]
     if key not in BUSINESSES:
         await cb.answer("Бизнес не найден!", show_alert=True); return
-    data = load_businesses(); rec = data[key]
-    if rec.get("owner_id") != uid:
-        await cb.answer("Это не твой бизнес!", show_alert=True); return
+    # FIX: защита от двойного клика — иначе бизнес продастся раз, а зачислится дважды
+    lock_key = f"{uid}:{key}"
+    if lock_key in _biz_sell_state_locks:
+        await cb.answer("⏳ Подожди...", show_alert=True); return
+    _biz_sell_state_locks.add(lock_key)
+    try:
+        data = load_businesses(); rec = data[key]
+        if rec.get("owner_id") != uid:
+            await cb.answer("Это не твой бизнес!", show_alert=True); return
 
-    payout = business_state_sell_price(key)
-    db = load_db(); user = get_user(db, uid, cb.from_user.first_name, cb.from_user.username or "")
-    user["balance"] += payout
-    add_log(db, uid, "business_sell_state", f"+{fmt(payout)} ({BUSINESSES[key]['name']})")
+        payout = business_state_sell_price(key)
+        # Сначала освобождаем бизнес в файле, потом зачисляем — защита от задвоения
+        data[key] = {"owner_id": None, "owner_name": "", "last_claim": int(time.time()), "balance": 0, "sale_price": None}
+        save_businesses(data)
+        new_bal = apply_balance_delta(uid, delta_balance=payout,
+            log_action="business_sell_state", log_detail=f"+{fmt(payout)} ({BUSINESSES[key]['name']})")
 
-    data[key] = {"owner_id": None, "owner_name": "", "last_claim": int(time.time()), "balance": 0, "sale_price": None}
-    save_db(db); save_businesses(data)
-
-    await edit_msg(cb.message.chat.id, cb.message.message_id,
-        f"🏛 <b>Бизнес продан государству!</b>\n\n"
-        f"🏢 <b>{BUSINESSES[key]['name']}</b>\n"
-        f"💰 Получено: <code>{fmt(payout)}</code>\n\n"
-        f"Баланс: <code>{fmt(user['balance'])}</code>", businesses_kb(uid))
-    await cb.answer("✅ Продано в госс")
+        await edit_msg(cb.message.chat.id, cb.message.message_id,
+            f"🏛 <b>Бизнес продан государству!</b>\n\n"
+            f"🏢 <b>{BUSINESSES[key]['name']}</b>\n"
+            f"💰 Получено: <code>{fmt(payout)}</code>\n\n"
+            f"Баланс: <code>{fmt(new_bal)}</code>", businesses_kb(uid))
+        await cb.answer("✅ Продано в госс")
+    finally:
+        _biz_sell_state_locks.discard(lock_key)
 
 @dp.callback_query(F.data.startswith("biz_sell_select_"))
 async def business_sell_select_cb(cb: CallbackQuery, state: FSMContext):
@@ -1500,14 +1573,14 @@ async def pay_text_alias_cmd(msg: Message):
         if not amount: await send_msg(msg.chat.id, "❌ Неверная сумма!"); return
         if not tid.isdigit(): await send_msg(msg.chat.id, "❌ ID — число!"); return
         db = load_db(); ok, text_pay = await do_pay(msg, db, uid, tid, amount)
-        if ok: save_db(db)
+        # save_db больше не нужен — do_pay сохраняет атомарно внутри
         await send_msg(msg.chat.id, text_pay); return
     if len(parts) == 2 and msg.reply_to_message:
         amount = parse_amount(parts[1])
         if not amount: await send_msg(msg.chat.id, "❌ Неверная сумма!"); return
         tid = str(msg.reply_to_message.from_user.id)
         db = load_db(); ok, text_pay = await do_pay(msg, db, uid, tid, amount)
-        if ok: save_db(db)
+        # save_db больше не нужен — do_pay сохраняет атомарно внутри
         await send_msg(msg.chat.id, text_pay); return
     await send_msg(msg.chat.id,
         "💸 <b>Передать</b>\n\nФормат:\n<code>передать сумма ID</code>\nили ответом на сообщение: <code>передать сумма</code>")
@@ -2016,14 +2089,12 @@ async def football_shot_cb(cb: CallbackQuery):
     sess = sessions.pop(uid, None)
     if not sess or sess.get("game") != "football": await cb.answer("Новая игра!", show_alert=True); return
     await cb.answer("⚽ Удар!"); bet = sess["bet"]; payout = bet * 2
+    # FIX: проверяем баланс и списываем атомарно (без удержания db в памяти на время sleep)
     db = load_db(); user = get_user(db, uid, cb.from_user.first_name, cb.from_user.username or "")
     if user["balance"] < bet:
         await edit_msg(cb.message.chat.id, cb.message.message_id,
             f"❌ Мало средств!\n\nБаланс: <code>{fmt(user['balance'])}</code>\nСтавка: <code>{fmt(bet)}</code>", back_kb()); return
-
-    user["balance"] -= bet
-    add_log(db, uid, "football_bet", f"ставка {fmt(bet)}")
-    save_db(db)
+    apply_balance_delta(uid, delta_balance=-bet, log_action="football_bet", log_detail=f"ставка {fmt(bet)}")
 
     await edit_msg(cb.message.chat.id, cb.message.message_id, f"{ae('⚽',EI_OK)} <b>Удар...</b>")
     dice = await send_dice(cb.message.chat.id, "⚽")
@@ -2036,15 +2107,16 @@ async def football_shot_cb(cb: CallbackQuery):
     # 3, 4, 5 — гол; 1, 2 — промах/штанга.
     win = value in (3, 4, 5)
     if win:
-        user["balance"] += payout; user["stats"]["wins"] += 1
-        r = f"{ae('🎉',EI_OK)} <b>ГОЛ!</b> +<code>{fmt(payout)}</code>"; add_log(db, uid, "football_win", f"+{fmt(payout - bet)} | payout={fmt(payout)} | dice={value}")
+        new_bal = apply_balance_delta(uid, delta_balance=payout, delta_wins=1,
+            log_action="football_win", log_detail=f"+{fmt(payout - bet)} | payout={fmt(payout)} | dice={value}")
+        r = f"{ae('🎉',EI_OK)} <b>ГОЛ!</b> +<code>{fmt(payout)}</code>"
     else:
-        user["stats"]["losses"] += 1
-        r = f"{ae('🥅',EI_WARN)} <b>Мимо!</b> -<code>{fmt(bet)}</code>"; add_log(db, uid, "football_loss", f"-{fmt(bet)} | dice={value}")
+        new_bal = apply_balance_delta(uid, delta_losses=1,
+            log_action="football_loss", log_detail=f"-{fmt(bet)} | dice={value}")
         add_business_loss_income(bet)
-    save_db(db)
+        r = f"{ae('🥅',EI_WARN)} <b>Мимо!</b> -<code>{fmt(bet)}</code>"
     await edit_msg(cb.message.chat.id, cb.message.message_id,
-        f"⚽ <b>Результат</b>\n\n{r}\n\n💰 <code>{fmt(user['balance'])}</code>", game_nav_kb("game_football"))
+        f"⚽ <b>Результат</b>\n\n{r}\n\n💰 <code>{fmt(new_bal)}</code>", game_nav_kb("game_football"))
 
 # 🏀 БАСКЕТБОЛ
 def basketball_kb():
@@ -2068,10 +2140,7 @@ async def bball_shot_cb(cb: CallbackQuery):
     if user["balance"] < bet:
         await edit_msg(cb.message.chat.id, cb.message.message_id,
             f"❌ Мало средств!\n\nБаланс: <code>{fmt(user['balance'])}</code>\nСтавка: <code>{fmt(bet)}</code>", back_kb()); return
-
-    user["balance"] -= bet
-    add_log(db, uid, "basketball_bet", f"ставка {fmt(bet)}")
-    save_db(db)
+    apply_balance_delta(uid, delta_balance=-bet, log_action="basketball_bet", log_detail=f"ставка {fmt(bet)}")
 
     await edit_msg(cb.message.chat.id, cb.message.message_id, f"{ae('🏀',EI_OK)} <b>Бросок...</b>")
     dice = await send_dice(cb.message.chat.id, "🏀")
@@ -2080,19 +2149,18 @@ async def bball_shot_cb(cb: CallbackQuery):
         value = random.randint(1, 5)
     await asyncio.sleep(4.0)
 
-    # Для баскетбола Telegram Bot API возвращает value 1..5.
-    # 4 и 5 — попадание; 1..3 — промах.
     win = value in (4, 5)
     if win:
-        user["balance"] += payout; user["stats"]["wins"] += 1
-        r = f"{ae('🎉',EI_OK)} <b>Попал!</b> +<code>{fmt(payout)}</code>"; add_log(db, uid, "basketball_win", f"+{fmt(payout - bet)} | payout={fmt(payout)} | dice={value}")
+        new_bal = apply_balance_delta(uid, delta_balance=payout, delta_wins=1,
+            log_action="basketball_win", log_detail=f"+{fmt(payout - bet)} | payout={fmt(payout)} | dice={value}")
+        r = f"{ae('🎉',EI_OK)} <b>Попал!</b> +<code>{fmt(payout)}</code>"
     else:
-        user["stats"]["losses"] += 1
-        r = f"{ae('🚫',EI_WARN)} <b>Промах!</b> -<code>{fmt(bet)}</code>"; add_log(db, uid, "basketball_loss", f"-{fmt(bet)} | dice={value}")
+        new_bal = apply_balance_delta(uid, delta_losses=1,
+            log_action="basketball_loss", log_detail=f"-{fmt(bet)} | dice={value}")
         add_business_loss_income(bet)
-    save_db(db)
+        r = f"{ae('🚫',EI_WARN)} <b>Промах!</b> -<code>{fmt(bet)}</code>"
     await edit_msg(cb.message.chat.id, cb.message.message_id,
-        f"🏀 <b>Результат</b>\n\n{r}\n\n💰 <code>{fmt(user['balance'])}</code>", game_nav_kb("game_basketball"))
+        f"🏀 <b>Результат</b>\n\n{r}\n\n💰 <code>{fmt(new_bal)}</code>", game_nav_kb("game_basketball"))
 
 # 🎰 СЛОТЫ
 def slots_kb():
@@ -2120,10 +2188,7 @@ async def slots_spin_cb(cb: CallbackQuery):
     if user["balance"] < bet:
         await edit_msg(cb.message.chat.id, cb.message.message_id,
             f"❌ Мало средств!\n\nБаланс: <code>{fmt(user['balance'])}</code>\nСтавка: <code>{fmt(bet)}</code>", back_kb()); return
-
-    user["balance"] -= bet
-    add_log(db, uid, "slots_bet", f"ставка {fmt(bet)}")
-    save_db(db)
+    apply_balance_delta(uid, delta_balance=-bet, log_action="slots_bet", log_detail=f"ставка {fmt(bet)}")
 
     await edit_msg(cb.message.chat.id, cb.message.message_id, f"{ae('🎰',EI_WARN)} <b>Крутим...</b>")
     dice = await send_dice(cb.message.chat.id, "🎰")
@@ -2143,17 +2208,16 @@ async def slots_spin_cb(cb: CallbackQuery):
 
     if mult > 0:
         payout = int(bet * mult)
-        user["balance"] += payout; user["stats"]["wins"] += 1
+        new_bal = apply_balance_delta(uid, delta_balance=payout, delta_wins=1,
+            log_action="slots_win", log_detail=f"payout={fmt(payout)} | x{mult:g} | dice={value}")
         r = f"🎰 <b>{max_same} одинаковых!</b> x{mult:g}\n+<code>{fmt(payout)}</code>"
-        add_log(db, uid, "slots_win", f"payout={fmt(payout)} | x{mult:g} | dice={value}")
     else:
-        user["stats"]["losses"] += 1
-        r = f"💀 <b>Не совпало</b>\n-<code>{fmt(bet)}</code>"
-        add_log(db, uid, "slots_loss", f"-{fmt(bet)} | dice={value}")
+        new_bal = apply_balance_delta(uid, delta_losses=1,
+            log_action="slots_loss", log_detail=f"-{fmt(bet)} | dice={value}")
         add_business_loss_income(bet)
-    save_db(db)
+        r = f"💀 <b>Не совпало</b>\n-<code>{fmt(bet)}</code>"
     await edit_msg(cb.message.chat.id, cb.message.message_id,
-        f"🎰 <b>Результат</b>\n\n{r}\n\n💰 <code>{fmt(user['balance'])}</code>", game_nav_kb("game_slots"))
+        f"🎰 <b>Результат</b>\n\n{r}\n\n💰 <code>{fmt(new_bal)}</code>", game_nav_kb("game_slots"))
 
 # 🎯 ДАРТС
 def darts_kb():
@@ -2176,7 +2240,7 @@ async def darts_throw_cb(cb: CallbackQuery):
     if user["balance"] < bet:
         await edit_msg(cb.message.chat.id, cb.message.message_id,
             f"❌ Мало средств!\n\nБаланс: <code>{fmt(user['balance'])}</code>\nСтавка: <code>{fmt(bet)}</code>", back_kb()); return
-    user["balance"] -= bet; add_log(db, uid, "darts_bet", f"ставка {fmt(bet)}"); save_db(db)
+    apply_balance_delta(uid, delta_balance=-bet, log_action="darts_bet", log_detail=f"ставка {fmt(bet)}")
     await edit_msg(cb.message.chat.id, cb.message.message_id, "🎯 <b>Бросок...</b>")
     dice = await send_dice(cb.message.chat.id, "🎯")
     value = get_dice_value(dice) or random.randint(1, 6)
@@ -2185,17 +2249,16 @@ async def darts_throw_cb(cb: CallbackQuery):
     mult = mults.get(value, 0)
     if mult:
         payout = int(bet * mult)
-        user["balance"] += payout; user["stats"]["wins"] += 1
+        new_bal = apply_balance_delta(uid, delta_balance=payout, delta_wins=1,
+            log_action="darts_win", log_detail=f"payout={fmt(payout)} | x{mult:g} | dice={value}")
         r = f"🎯 <b>Попадание!</b> x{mult:g}\n+<code>{fmt(payout)}</code>"
-        add_log(db, uid, "darts_win", f"payout={fmt(payout)} | x{mult:g} | dice={value}")
     else:
-        user["stats"]["losses"] += 1
-        r = f"💀 <b>Мимо</b>\n-<code>{fmt(bet)}</code>"
-        add_log(db, uid, "darts_loss", f"-{fmt(bet)} | dice={value}")
+        new_bal = apply_balance_delta(uid, delta_losses=1,
+            log_action="darts_loss", log_detail=f"-{fmt(bet)} | dice={value}")
         add_business_loss_income(bet)
-    save_db(db)
+        r = f"💀 <b>Мимо</b>\n-<code>{fmt(bet)}</code>"
     await edit_msg(cb.message.chat.id, cb.message.message_id,
-        f"🎯 <b>Результат</b>\n\n{r}\n\n💰 <code>{fmt(user['balance'])}</code>", game_nav_kb("game_darts"))
+        f"🎯 <b>Результат</b>\n\n{r}\n\n💰 <code>{fmt(new_bal)}</code>", game_nav_kb("game_darts"))
 
 # 📈 КРАШ
 CRASH_TARGETS = [1.2, 1.5, 2.0, 3.0, 5.0]
@@ -2228,24 +2291,23 @@ async def crash_target_cb(cb: CallbackQuery):
     if user["balance"] < bet:
         await edit_msg(cb.message.chat.id, cb.message.message_id,
             f"❌ Мало средств!\n\nБаланс: <code>{fmt(user['balance'])}</code>\nСтавка: <code>{fmt(bet)}</code>", back_kb()); return
-    user["balance"] -= bet; add_log(db, uid, "crash_bet", f"ставка {fmt(bet)} | цель x{target:g}"); save_db(db)
+    apply_balance_delta(uid, delta_balance=-bet, log_action="crash_bet", log_detail=f"ставка {fmt(bet)} | цель x{target:g}")
     await cb.answer("📈 Запуск!")
     crash_at = random_crash_point()
     await edit_msg(cb.message.chat.id, cb.message.message_id, f"📈 <b>Растёт...</b>\n\nЦель: <b>x{target:g}</b>")
     await asyncio.sleep(2.0)
     if crash_at >= target:
         payout = int(bet * target)
-        user["balance"] += payout; user["stats"]["wins"] += 1
+        new_bal = apply_balance_delta(uid, delta_balance=payout, delta_wins=1,
+            log_action="crash_win", log_detail=f"payout={fmt(payout)} | target=x{target:g} | crash=x{crash_at:g}")
         r = f"✅ <b>Успел!</b> x{target:g}\n+<code>{fmt(payout)}</code>\n\nКраш был на x{crash_at:g}"
-        add_log(db, uid, "crash_win", f"payout={fmt(payout)} | target=x{target:g} | crash=x{crash_at:g}")
     else:
-        user["stats"]["losses"] += 1
-        r = f"💥 <b>Краш на x{crash_at:g}</b>\n-<code>{fmt(bet)}</code>"
-        add_log(db, uid, "crash_loss", f"-{fmt(bet)} | target=x{target:g} | crash=x{crash_at:g}")
+        new_bal = apply_balance_delta(uid, delta_losses=1,
+            log_action="crash_loss", log_detail=f"-{fmt(bet)} | target=x{target:g} | crash=x{crash_at:g}")
         add_business_loss_income(bet)
-    save_db(db)
+        r = f"💥 <b>Краш на x{crash_at:g}</b>\n-<code>{fmt(bet)}</code>"
     await edit_msg(cb.message.chat.id, cb.message.message_id,
-        f"📈 <b>Краш</b>\n\n{r}\n\n💰 <code>{fmt(user['balance'])}</code>", game_nav_kb("game_crash"))
+        f"📈 <b>Краш</b>\n\n{r}\n\n💰 <code>{fmt(new_bal)}</code>", game_nav_kb("game_crash"))
 
 # 🃏 21 ОЧКО
 CARD_DECK = [(str(n), n) for n in range(2, 11)] + [("В", 2), ("Д", 3), ("К", 4), ("Т", 11)]
@@ -2398,13 +2460,14 @@ async def gold_cashout_cb(cb: CallbackQuery):
     if not sess or sess.get("game") != "gold": await cb.answer("Нет игры!", show_alert=True); return
     level = sess.get("level", 0)
     if level <= 0:
+        # вернуть сессию назад
+        sessions[uid] = sess
         await cb.answer("Сначала найди золото!", show_alert=True); return
     bet = sess["bet"]; mult = GOLD_MULTS[level-1]; payout = int(bet * mult)
-    db = load_db(); user = get_user(db, uid, cb.from_user.first_name, cb.from_user.username or "")
-    user["balance"] += payout; user["stats"]["wins"] += 1
-    add_log(db, uid, "gold_cashout", f"payout={fmt(payout)} | x{mult:.2f}"); save_db(db)
+    new_bal = apply_balance_delta(uid, delta_balance=payout, delta_wins=1,
+        log_action="gold_cashout", log_detail=f"payout={fmt(payout)} | x{mult:.2f}")
     await edit_msg(cb.message.chat.id, cb.message.message_id,
-        f"✅ <b>Забрал золото!</b>\n\nУровень: <b>{level}</b>/12\nВыплата: <code>{fmt(payout)}</code> (x{mult:.2f})\n\n💰 <code>{fmt(user['balance'])}</code>", game_nav_kb("game_gold"))
+        f"✅ <b>Забрал золото!</b>\n\nУровень: <b>{level}</b>/12\nВыплата: <code>{fmt(payout)}</code> (x{mult:.2f})\n\n💰 <code>{fmt(new_bal)}</code>", game_nav_kb("game_gold"))
     await cb.answer("💰 Забрал!")
 
 # 💣 МИНЫ
@@ -2543,25 +2606,28 @@ async def mines_open_cb(cb: CallbackQuery):
 
 @dp.callback_query(F.data == "mines_cashout")
 async def mines_cashout_cb(cb: CallbackQuery):
-    uid = str(cb.from_user.id); sess = sessions.get(uid)
+    uid = str(cb.from_user.id)
+    # FIX: атомарное удаление сессии — кто первый, тот и забрал
+    sess = sessions.pop(uid, None)
     if not sess or sess.get("game") != "mines": await cb.answer("Нет игры!", show_alert=True); return
     mines = set(sess["mines"]); revealed = sess["revealed"]; bet = sess["bet"]; mines_count = sess.get("mines_count", len(mines))
     safe_opened = mines_safe_opened(revealed, mines)
     if safe_opened <= 0:
+        # вернуть сессию назад, чтобы игрок мог продолжить
+        sessions[uid] = sess
         await cb.answer("Сначала открой хотя бы одну клетку!", show_alert=True); return
 
-    sessions.pop(uid, None)
     await cb.answer("💰 Забрал!")
     mult = mines_multiplier(safe_opened, mines_count); payout = mines_payout(bet, safe_opened, mines_count)
-    db = load_db(); user = get_user(db, uid, cb.from_user.first_name, cb.from_user.username or "")
-    user["balance"] += payout; user["stats"]["wins"] += 1
-    add_log(db, uid, "mines_cashout", f"payout={fmt(payout)} | x{mult:.2f} | мин={mines_count}"); add_business_win_income(payout); save_db(db)
+    new_bal = apply_balance_delta(uid, delta_balance=payout, delta_wins=1,
+        log_action="mines_cashout", log_detail=f"payout={fmt(payout)} | x{mult:.2f} | мин={mines_count}")
+    add_business_win_income(payout)
     await edit_msg(cb.message.chat.id, cb.message.message_id,
         f"{ae('✅',EI_OK)} <b>Забрал!</b>\n\n"
         f"💎 Открыто: <b>{safe_opened}</b>/<b>{mines_safe_total(mines_count)}</b>\n"
         f"📈 Множитель: <b>x{mult:.2f}</b>\n"
         f"Выплата: <code>{fmt(payout)}</code>\n\n"
-        f"💰 <code>{fmt(user['balance'])}</code>", game_nav_kb("game_mines"))
+        f"💰 <code>{fmt(new_bal)}</code>", game_nav_kb("game_mines"))
 
 # ─── NOOP ────────────────────────────────────────────────────────────────────
 @dp.callback_query(F.data == "noop")
