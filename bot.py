@@ -414,8 +414,13 @@ def businesses_kb(uid):
         owner_id = rec.get("owner_id")
         sale_price = rec.get("sale_price")
         if owner_id == uid:
+            # FIX: если уже выставлен на продажу — даём кнопку «Снять с продажи»
+            if sale_price:
+                sell_btn = btn(f"❎ Снять с продажи ({fmt(sale_price)})", f"biz_sell_cancel_{key}", style="danger", icon=EI_WARN)
+            else:
+                sell_btn = btn("🏷 Игроку", f"biz_sell_select_{key}", style="primary", icon=EI_STAR)
             rows.append([btn(f"💰 Доход: {cfg['name']}", f"biz_claim_{key}", style="success", icon=EI_OK),
-                         btn("🏷 Игроку", f"biz_sell_select_{key}", style="primary", icon=EI_STAR),
+                         sell_btn,
                          btn("🏛 В госс", f"biz_sell_state_{key}", style="danger", icon=EI_WARN)])
         elif not has_biz and sale_price:
             rows.append([btn(f"🛒 Купить {cfg['name']} за {fmt(sale_price)}", f"biz_buy_sale_{key}", style="success", icon=EI_OK)])
@@ -1180,27 +1185,37 @@ async def business_buy_cb(cb: CallbackQuery):
         businesses_kb(uid))
     await cb.answer("✅ Куплено!")
 
+_biz_claim_locks = set()
+
 @dp.callback_query(F.data.startswith("biz_claim_"))
 async def business_claim_cb(cb: CallbackQuery):
     uid = str(cb.from_user.id); key = cb.data[len("biz_claim_"):]
     if key not in BUSINESSES:
         await cb.answer("Бизнес не найден!", show_alert=True); return
-    data = load_businesses(); rec = data[key]
-    if rec.get("owner_id") != uid:
-        await cb.answer("Это не твой бизнес!", show_alert=True); return
-    pending, hours = business_pending_income(key, rec)
-    if pending <= 0:
-        await cb.answer("Дохода пока нет!", show_alert=True); return
-    db = load_db(); user = get_user(db, uid, cb.from_user.first_name, cb.from_user.username or "")
-    user["balance"] += pending
-    add_log(db, uid, "business_claim", f"+{fmt(pending)} ({BUSINESSES[key]['name']})")
-    rec["balance"] = 0
-    rec["last_claim"] = int(time.time())
-    save_db(db); save_businesses(data)
-    await edit_msg(cb.message.chat.id, cb.message.message_id,
-        f"✅ <b>Доход забран!</b>\n\n🏢 <b>{BUSINESSES[key]['name']}</b>\n💰 +<code>{fmt(pending)}</code>\n\nБаланс: <code>{fmt(user['balance'])}</code>",
-        businesses_kb(uid))
-    await cb.answer("✅ Зачислено!")
+    # FIX: защита от дюпа дохода при двойном клике
+    lock_key = f"{uid}:{key}"
+    if lock_key in _biz_claim_locks:
+        await cb.answer("⏳ Подожди...", show_alert=True); return
+    _biz_claim_locks.add(lock_key)
+    try:
+        data = load_businesses(); rec = data[key]
+        if rec.get("owner_id") != uid:
+            await cb.answer("Это не твой бизнес!", show_alert=True); return
+        pending, hours = business_pending_income(key, rec)
+        if pending <= 0:
+            await cb.answer("Дохода пока нет!", show_alert=True); return
+        db = load_db(); user = get_user(db, uid, cb.from_user.first_name, cb.from_user.username or "")
+        user["balance"] += pending
+        add_log(db, uid, "business_claim", f"+{fmt(pending)} ({BUSINESSES[key]['name']})")
+        rec["balance"] = 0
+        rec["last_claim"] = int(time.time())
+        save_db(db); save_businesses(data)
+        await edit_msg(cb.message.chat.id, cb.message.message_id,
+            f"✅ <b>Доход забран!</b>\n\n🏢 <b>{BUSINESSES[key]['name']}</b>\n💰 +<code>{fmt(pending)}</code>\n\nБаланс: <code>{fmt(user['balance'])}</code>",
+            businesses_kb(uid))
+        await cb.answer("✅ Зачислено!")
+    finally:
+        _biz_claim_locks.discard(lock_key)
 
 @dp.callback_query(F.data.startswith("biz_sell_state_"))
 async def business_sell_state_cb(cb: CallbackQuery):
@@ -1233,6 +1248,8 @@ async def business_sell_select_cb(cb: CallbackQuery, state: FSMContext):
     data = load_businesses()
     if key not in BUSINESSES or data[key].get("owner_id") != uid:
         await cb.answer("Это не твой бизнес!", show_alert=True); return
+    if data[key].get("sale_price"):
+        await cb.answer("❌ Бизнес уже на продаже. Сначала сними его.", show_alert=True); return
     await state.set_state(BusinessStates.waiting_sell_price)
     await state.update_data(biz_key=key)
     await edit_msg(cb.message.chat.id, cb.message.message_id,
@@ -1240,6 +1257,27 @@ async def business_sell_select_cb(cb: CallbackQuery, state: FSMContext):
         f"Бизнес: <b>{BUSINESSES[key]['name']}</b>\n\n"
         f"Введи цену продажи:", cancel_kb())
     await cb.answer()
+
+# FIX: снятие бизнеса с продажи
+@dp.callback_query(F.data.startswith("biz_sell_cancel_"))
+async def business_sell_cancel_cb(cb: CallbackQuery):
+    uid = str(cb.from_user.id); key = cb.data[len("biz_sell_cancel_"):]
+    if key not in BUSINESSES:
+        await cb.answer("Бизнес не найден!", show_alert=True); return
+    data = load_businesses(); rec = data[key]
+    if rec.get("owner_id") != uid:
+        await cb.answer("Это не твой бизнес!", show_alert=True); return
+    if not rec.get("sale_price"):
+        await cb.answer("Этот бизнес и так не на продаже.", show_alert=True); return
+    rec["sale_price"] = None
+    save_businesses(data)
+    db = load_db()
+    add_log(db, uid, "business_sell_cancel", BUSINESSES[key]["name"])
+    save_db(db)
+    await edit_msg(cb.message.chat.id, cb.message.message_id,
+        f"❎ <b>Бизнес снят с продажи</b>\n\n🏢 <b>{BUSINESSES[key]['name']}</b>",
+        businesses_kb(uid))
+    await cb.answer("✅ Снят с продажи")
 
 @dp.pre_checkout_query()
 async def pre_checkout_cb(pre: PreCheckoutQuery):
@@ -1380,20 +1418,30 @@ async def stats_cb(cb: CallbackQuery):
         f"💰 <code>{fmt(user['balance'])}</code>", back_kb())
     await cb.answer()
 
+_bonus_locks = set()
+
 @dp.callback_query(F.data == "daily_bonus")
 async def daily_bonus_cb(cb: CallbackQuery):
-    db = load_db(); uid = str(cb.from_user.id)
-    user = get_user(db, uid, cb.from_user.first_name, cb.from_user.username or "")
-    today = str(date.today())
-    if user["last_bonus"] == today:
-        await edit_msg(cb.message.chat.id, cb.message.message_id,
-            f"🎁 <b>Бонус</b>\n\n⏰ Уже получен!\nЗавтра — <b>$1.000.000</b>\n\n💰 <code>{fmt(user['balance'])}</code>", back_kb())
-    else:
-        user["balance"] += 1_000_000; user["last_bonus"] = today
-        add_log(db, uid, "bonus", "+$1.000.000"); save_db(db)
-        await edit_msg(cb.message.chat.id, cb.message.message_id,
-            f"🎁 <b>Бонус!</b>\n\n{ae('🎉', EI_OK)} <b>+$1.000.000</b>\n\n💰 <code>{fmt(user['balance'])}</code>", back_kb())
-    await cb.answer()
+    uid = str(cb.from_user.id)
+    # FIX: защита от двойного клика
+    if uid in _bonus_locks:
+        await cb.answer("⏳ Подожди...", show_alert=True); return
+    _bonus_locks.add(uid)
+    try:
+        db = load_db()
+        user = get_user(db, uid, cb.from_user.first_name, cb.from_user.username or "")
+        today = str(date.today())
+        if user["last_bonus"] == today:
+            await edit_msg(cb.message.chat.id, cb.message.message_id,
+                f"🎁 <b>Бонус</b>\n\n⏰ Уже получен!\nЗавтра — <b>$1.000.000</b>\n\n💰 <code>{fmt(user['balance'])}</code>", back_kb())
+        else:
+            user["balance"] += 1_000_000; user["last_bonus"] = today
+            add_log(db, uid, "bonus", "+$1.000.000"); save_db(db)
+            await edit_msg(cb.message.chat.id, cb.message.message_id,
+                f"🎁 <b>Бонус!</b>\n\n{ae('🎉', EI_OK)} <b>+$1.000.000</b>\n\n💰 <code>{fmt(user['balance'])}</code>", back_kb())
+        await cb.answer()
+    finally:
+        _bonus_locks.discard(uid)
 
 @dp.callback_query(F.data == "referral")
 async def referral_cb(cb: CallbackQuery):
@@ -1552,6 +1600,16 @@ async def promo_user_code(msg: Message, state: FSMContext):
 
 @dp.callback_query(F.data == "promo_create")
 async def promo_create_cb(cb: CallbackQuery, state: FSMContext):
+    # FIX: блокируем повторное создание промокода
+    uid = str(cb.from_user.id)
+    db = load_db(); user = get_user(db, uid, cb.from_user.first_name, cb.from_user.username or "")
+    if user.get("created_promo"):
+        await cb.answer("❌ У тебя уже есть промокод!", show_alert=True)
+        await edit_msg(cb.message.chat.id, cb.message.message_id,
+            f"❌ <b>Свой промокод можно создать только 1 раз!</b>\n\n"
+            f"🎟️ Твой код: <code>{user['created_promo']}</code>\n\n"
+            f"<i>Открой «📋 Мой промокод», чтобы увидеть статистику.</i>", back_promo_kb())
+        return
     await state.set_state(PromoStates.create_code)
     await edit_msg(cb.message.chat.id, cb.message.message_id,
         "➕ <b>Создать промокод</b>\n\nКод (3-15, латиница+цифры):\n<i>+ $500.000 за активацию на промо-баланс</i>", cancel_kb())
@@ -1560,13 +1618,26 @@ async def promo_create_cb(cb: CallbackQuery, state: FSMContext):
 @dp.message(PromoStates.create_code)
 async def promo_create_msg(msg: Message, state: FSMContext):
     code = msg.text.strip().upper(); uid = str(msg.from_user.id)
+    # FIX: повторная проверка на момент сохранения (защита от гонок и обхода через FSM)
+    db = load_db(); user = get_user(db, uid, msg.from_user.first_name, msg.from_user.username or "")
+    if user.get("created_promo"):
+        await state.clear()
+        await send_msg(msg.chat.id,
+            f"❌ <b>У тебя уже есть промокод!</b>\n\n🎟️ <code>{user['created_promo']}</code>", back_promo_kb())
+        return
     if len(code) < 3 or len(code) > 15 or not code.isalnum():
         await send_msg(msg.chat.id, "❌ 3-15, латиница+цифры!", cancel_kb()); return
     promos = load_promos()
     if code in promos.get("admin", {}) or code in promos.get("user", {}):
         await send_msg(msg.chat.id, "❌ Занят!", cancel_kb()); return
+    # FIX: дополнительно — один промо на одного автора в promos.json
+    for c, p in promos.get("user", {}).items():
+        if str(p.get("creator_id")) == uid:
+            db[uid]["created_promo"] = c; save_db(db); await state.clear()
+            await send_msg(msg.chat.id,
+                f"❌ <b>У тебя уже есть промокод!</b>\n\n🎟️ <code>{c}</code>", back_promo_kb())
+            return
     promos.setdefault("user", {})[code] = {"creator_id": uid, "activations": 0, "activated_by": []}
-    db = load_db(); get_user(db, uid, msg.from_user.first_name, msg.from_user.username or "")
     db[uid]["created_promo"] = code; save_db(db); save_promos(promos); await state.clear()
     await send_msg(msg.chat.id,
         f"✅ <b>Создан!</b>\n\n🎟️ <code>{code}</code>\n💰 Автору: +{fmt(PROMO_CREATOR_REWARD)} за активацию\n👤 Игроку: +{fmt(PROMO_USER_REWARD)}\n\n<i>Поделись!</i>", back_promo_kb())
@@ -1588,16 +1659,28 @@ async def promo_my_cb(cb: CallbackQuery):
         f"💰 Промо-баланс: <code>{fmt(pe)}</code>\n<i>Заработано: {fmt(acts * PROMO_CREATOR_REWARD)}</i>", {"inline_keyboard": rows})
     await cb.answer()
 
+_withdraw_locks = set()
+
 @dp.callback_query(F.data == "promo_withdraw")
 async def promo_withdraw_cb(cb: CallbackQuery):
-    db = load_db(); uid = str(cb.from_user.id)
-    user = get_user(db, uid, cb.from_user.first_name, cb.from_user.username or "")
-    pe = user.get("promo_earnings", 0)
-    if pe <= 0: await cb.answer("Нечего забирать!", show_alert=True); return
-    user["balance"] += pe; add_log(db, uid, "promo_withdraw", f"+{fmt(pe)}"); user["promo_earnings"] = 0; save_db(db)
-    await edit_msg(cb.message.chat.id, cb.message.message_id,
-        f"✅ <b>Забрано!</b>\n\n+<code>{fmt(pe)}</code>\n\n💰 Баланс: <code>{fmt(user['balance'])}</code>", back_promo_kb())
-    await cb.answer("✅ Зачислено!")
+    uid = str(cb.from_user.id)
+    # FIX: защита от дюпа при быстром двойном клике
+    if uid in _withdraw_locks:
+        await cb.answer("⏳ Подожди...", show_alert=True); return
+    _withdraw_locks.add(uid)
+    try:
+        db = load_db()
+        user = get_user(db, uid, cb.from_user.first_name, cb.from_user.username or "")
+        pe = user.get("promo_earnings", 0)
+        if pe <= 0:
+            await cb.answer("Нечего забирать!", show_alert=True); return
+        user["balance"] += pe; add_log(db, uid, "promo_withdraw", f"+{fmt(pe)}")
+        user["promo_earnings"] = 0; save_db(db)
+        await edit_msg(cb.message.chat.id, cb.message.message_id,
+            f"✅ <b>Забрано!</b>\n\n+<code>{fmt(pe)}</code>\n\n💰 Баланс: <code>{fmt(user['balance'])}</code>", back_promo_kb())
+        await cb.answer("✅ Зачислено!")
+    finally:
+        _withdraw_locks.discard(uid)
 
 # ═══════════════════════════════════════════════════════════════════════════════
 # АДМИН-ПАНЕЛЬ
