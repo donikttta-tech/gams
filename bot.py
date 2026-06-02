@@ -143,6 +143,7 @@ def get_user(db, uid, name="Игрок", username=""):
             "name": name, "username": username,
             "balance": 2_500_000, "promo_earnings": 0,
             "joined": str(date.today()), "last_bonus": None,
+            "last_dive": 0,
             "referrals": [], "referred_by": None,
             "verified": False, "banned": False,
             "stats": {"wins": 0, "losses": 0, "draws": 0},
@@ -154,6 +155,7 @@ def get_user(db, uid, name="Игрок", username=""):
         db[uid]["name"] = name
         if username:
             db[uid]["username"] = username
+        db[uid].setdefault("last_dive", 0)
     return db[uid]
 
 def fmt(n):
@@ -338,12 +340,16 @@ SHOP_RATE_PER_STAR = 1_500_000
 SHOP_STAR_PACKS = [1, 5, 10, 25, 50, 100]
 
 BUSINESSES = {
-    "bakery": {"name": "Пекарня", "price": 50_000_000, "hourly": 500_000,
-               "desc": "доход 500.000 в час"},
-    "burger": {"name": "Бургер Кинг", "price": 100_000_000, "hourly": 1_500_000,
-               "desc": "доход 1.500.000 в час"},
+    "bakery": {"name": "Пекарня", "price": 50_000_000, "hourly": 4_500_000,
+               "desc": "доход 4.500.000 в час"},
+    "shaurma": {"name": "Ларёк с шаурмой", "price": 20_000_000, "hourly": 2_000_000,
+                "desc": "доход 2.000.000 в час"},
+    "burger": {"name": "Бургер Кинг", "price": 100_000_000, "hourly": 5_000_000,
+               "desc": "доход 5.000.000 в час"},
     "bank": {"name": "Спермо Банк", "price": 200_000_000, "hourly": 5_000_000,
              "desc": "доход 5.000.000 в час"},
+    "dota_pizza": {"name": "Дота Пицца", "price": 500_000_000, "hourly": 25_000_000,
+                   "desc": "доход 25.000.000 в час"},
     "computer_club": {"name": "Компьютерный клуб", "price": 500_000_000, "hourly": 0,
                       "desc": "20% от выигрышей в дуэлях и минах"},
     "casino": {"name": "Казино", "stars": 50, "hourly": 0,
@@ -357,6 +363,189 @@ duel_player_map = {}
 duel_turn_tasks = {}
 duel_counter = 0
 DUEL_TIMEOUT = 300  # 5 минут на принятие заявки и на каждый ход
+
+# ─── BUTTON EXPIRY ──────────────────────────────────────────────────────────
+BUTTON_EXPIRY_SEC = 3600  # 1 час
+button_expiry = {}  # {chat_id: {message_id: timestamp}}
+
+def mark_button_expiry(chat_id, msg_id):
+    chat_id = str(chat_id)
+    button_expiry.setdefault(chat_id, {})[str(msg_id)] = int(time.time())
+
+async def check_button_expiry(chat_id, msg_id):
+    """Возвращает True если кнопка устарела, и отправляет сообщение."""
+    chat_id = str(chat_id); msg_id = str(msg_id)
+    ts = button_expiry.get(chat_id, {}).get(msg_id)
+    if not ts:
+        return False
+    if int(time.time()) - ts > BUTTON_EXPIRY_SEC:
+        del button_expiry[chat_id][msg_id]
+        try:
+            await send_msg(int(chat_id),
+                "⌛ <b>Кнопки устарели!</b>\n\nПрошло больше часа. Пожалуйста, открой меню заново.")
+        except: pass
+        return True
+    return False
+
+# ─── DAILY TAX ──────────────────────────────────────────────────────────────
+TAX_FILE = "tax.json"
+
+def load_tax():
+    if os.path.exists(TAX_FILE):
+        with open(TAX_FILE, "r", encoding="utf-8") as f:
+            return json.load(f)
+    return {"last_tax_day": "", "total_collected": 0}
+
+def save_tax(data):
+    with open(TAX_FILE, "w", encoding="utf-8") as f:
+        json.dump(data, f, ensure_ascii=False, indent=2)
+
+def calculate_tax(balance):
+    """Прогрессивный налог: чем больше баланс, тем выше ставка."""
+    if balance < 10_000_000:
+        return 0
+    elif balance < 50_000_000:
+        return int(balance * 0.01)  # 1%
+    elif balance < 200_000_000:
+        return int(balance * 0.03)  # 3%
+    elif balance < 500_000_000:
+        return int(balance * 0.05)  # 5%
+    elif balance < 1_000_000_000:
+        return int(balance * 0.07)  # 7%
+    else:
+        return int(balance * 0.10)  # 10%
+
+async def apply_daily_tax():
+    """Применяет ежедневный налог ко всем игрокам."""
+    db = load_db(); tax_data = load_tax()
+    today = str(date.today())
+    if tax_data.get("last_tax_day") == today:
+        return  # уже применяли сегодня
+    total_tax = 0; affected = 0
+    for uid, u in db.items():
+        if not u.get("verified") or u.get("banned"):
+            continue
+        bal = int(u.get("balance", 0))
+        tax = calculate_tax(bal)
+        if tax > 0:
+            u["balance"] = max(0, bal - tax)
+            total_tax += tax; affected += 1
+            add_log(db, uid, "tax", f"-{fmt(tax)} (налог бизнеса)")
+    tax_data["last_tax_day"] = today
+    tax_data["total_collected"] = tax_data.get("total_collected", 0) + total_tax
+    save_tax(tax_data); save_db(db)
+    # Уведомление админу
+    try:
+        await send_msg(int(ADMIN_ID),
+            f"🏛 <b>Ежедневный налог собран!</b>\n\n"
+            f"📅 {today}\n👥 Затронуто: <b>{affected}</b>\n"
+            f"💰 Собрано: <code>{fmt(total_tax)}</code>\n"
+            f"📊 Всего собрано: <code>{fmt(tax_data['total_collected'])}</code>")
+    except: pass
+
+async def tax_daily_loop():
+    """Фоновый цикл проверки налога каждый час."""
+    while True:
+        await asyncio.sleep(3600)  # проверка раз в час
+        try:
+            await apply_daily_tax()
+        except Exception as e:
+            print(f"Tax error: {e}")
+
+# ─── GOLDEN TICKET ──────────────────────────────────────────────────────────
+GOLDEN_TICKET_FILE = "golden_ticket.json"
+
+def load_golden_ticket():
+    if os.path.exists(GOLDEN_TICKET_FILE):
+        with open(GOLDEN_TICKET_FILE, "r", encoding="utf-8") as f:
+            return json.load(f)
+    return {"bank": 0, "players": {}, "last_game_day": "", "next_game_ts": 0, "history": []}
+
+def save_golden_ticket(data):
+    with open(GOLDEN_TICKET_FILE, "w", encoding="utf-8") as f:
+        json.dump(data, f, ensure_ascii=False, indent=2)
+
+async def golden_ticket_daily_loop():
+    """Фоновый цикл: раз в день определяет победителя Золотого Билета."""
+    while True:
+        await asyncio.sleep(60)  # проверка раз в минуту
+        try:
+            gt = load_golden_ticket()
+            now = int(time.time())
+            today = str(date.today())
+            # Если игра уже была сегодня — не запускаем
+            if gt.get("last_game_day") == today:
+                # но победитель ещё не определён и время вышло
+                if gt.get("next_game_ts") and now >= gt["next_game_ts"] and gt.get("players"):
+                    await finish_golden_ticket(gt)
+                continue
+            # Запланировать игру через час, если ещё нет расписания
+            if not gt.get("next_game_ts") or gt["next_game_ts"] < now:
+                gt["next_game_ts"] = now + 3600  # игра через час
+                gt["last_game_day"] = today
+                gt["bank"] = 0
+                gt["players"] = {}
+                save_golden_ticket(gt)
+                # Оповестить всех о начале приёма ставок
+                await notify_golden_ticket_start(gt)
+        except Exception as e:
+            print(f"Golden ticket error: {e}")
+
+async def finish_golden_ticket(gt):
+    """Определяет победителя и распределяет банк."""
+    players = gt.get("players", {})
+    if not players:
+        gt["next_game_ts"] = 0; save_golden_ticket(gt); return
+    bank = gt.get("bank", 0)
+    # Выбираем победителя
+    winner_id = random.choice(list(players.keys()))
+    db = load_db()
+    if winner_id in db:
+        db[winner_id]["balance"] = db[winner_id].get("balance", 0) + bank
+        add_log(db, winner_id, "golden_ticket_win", f"+{fmt(bank)} выигрыш")
+        try:
+            await send_msg(int(winner_id),
+                f"🎫 <b>ЗОЛОТОЙ БИЛЕТ — ТЫ ПОБЕДИЛ!</b>\n\n"
+                f"🏆 Ты выиграл банк: <code>{fmt(bank)}</code>\n\n"
+                f"💰 Баланс: <code>{fmt(db[winner_id]['balance'])}</code>")
+        except: pass
+    # История
+    gt.setdefault("history", []).append({
+        "date": str(date.today()), "winner": winner_id,
+        "bank": bank, "players_count": len(players)
+    })
+    # Сброс
+    gt["next_game_ts"] = 0; gt["bank"] = 0; gt["players"] = {}
+    save_golden_ticket(gt); save_db(db)
+    # Оповещаем участников
+    for pid in players:
+        if pid != winner_id:
+            try:
+                await send_msg(int(pid),
+                    f"🎫 <b>Золотой Билет — итоги</b>\n\n"
+                    f"К сожалению, ты не выиграл. Победитель получил <code>{fmt(bank)}</code>.\n"
+                    f"Попробуй снова завтра!")
+            except: pass
+
+async def notify_golden_ticket_start(gt):
+    """Оповещает всех верифицированных игроков о старте Золотого Билета."""
+    db = load_db()
+    for uid in db:
+        if db[uid].get("verified") and not db[uid].get("banned"):
+            try:
+                await send_msg(int(uid),
+                    f"🎫 <b>ЗОЛОТОЙ БИЛЕТ — ПРИЁМ СТАВОК!</b>\n\n"
+                    f"Делай ставку в разделе Игры → Золотой Билет.\n"
+                    f"Через 1 час определится победитель, который заберёт весь банк!\n\n"
+                    f"💰 Текущий банк: <code>{fmt(gt.get('bank', 0))}</code>")
+            except: pass
+
+# ─── DIVING ─────────────────────────────────────────────────────────────────
+DIVING_COOLDOWN = 1800  # 30 минут
+DIVING_PRIZES = [
+    (5_000_000, 30), (10_000_000, 25), (15_000_000, 20),
+    (20_000_000, 12), (30_000_000, 8), (50_000_000, 5)
+]
 
 # ─── KEYBOARDS ──────────────────────────────────────────────────────────────
 def sub_kb():
@@ -372,7 +561,8 @@ def main_menu_kb(is_admin=False):
          btn("🛒 Магазин", "cat_shop", style="success", icon=EI_OK)],
         [btn("📊 Инфо", "cat_info", style="primary", icon=EI_LIKE),
          btn("🏆 Рейтинг", "cat_rating", style="primary", icon=EI_LIKE)],
-        [btn("🎟️ Промокоды", "cat_promo", style="primary", icon=EI_STAR)],
+        [btn("🎟️ Промокоды", "cat_promo", style="primary", icon=EI_STAR),
+         btn("⚡ Команды", "open_commands", style="primary", icon=EI_LIKE)],
     ]
     if is_admin:
         rows.append([btn("🛠️ Админ", "admin_panel", style="danger", icon=EI_WARN)])
@@ -389,6 +579,9 @@ def games_kb():
         [btn("🃏  21 Очко", "game_blackjack", style="primary", icon=EI_STAR),
          btn("🏆  Золото", "game_gold", style="primary", icon=EI_STAR)],
         [btn("⚔️  Дуэль — TTT x2", "game_duel_info", style="primary", icon=EI_LIKE)],
+        [btn("🤿  Дайвинг", "game_diving", style="primary", icon=EI_STAR),
+         btn("🔫  Русская Рулетка", "game_russian_roulette", style="danger", icon=EI_WARN)],
+        [btn("🎫  Золотой Билет", "game_golden_ticket", style="success", icon=EI_OK)],
         [btn("🔙  Меню", "main_menu", icon=EI_STAR)])
 
 def bonus_kb():
@@ -500,18 +693,33 @@ def admin_kb():
         [btn("📢  Рассылка", "admin_broadcast", style="danger", icon=EI_WARN),
          btn("🔨  Бан/Разбан", "admin_ban_unban", style="danger", icon=EI_WARN)],
         [btn("💰  Баланс игрока", "admin_check_balance", style="primary", icon=EI_LIKE),
-         btn("📋  Логи", "admin_logs", style="primary", icon=EI_LIKE)],
+         btn("📋  Логи игрока", "admin_logs", style="primary", icon=EI_LIKE)],
         [btn("💸  Выдать $", "admin_give", style="success", icon=EI_OK),
          btn("📥  Забрать $", "admin_take", style="danger", icon=EI_WARN)],
         [btn("🎟️  Создать промо", "admin_create_promo", style="success", icon=EI_OK),
          btn("🗑️  Обнулить", "admin_reset", style="danger", icon=EI_WARN)],
         [btn("🏢 Выдать бизнес", "admin_give_business", style="success", icon=EI_OK),
          btn("📥 Забрать бизнес", "admin_take_business", style="danger", icon=EI_WARN)],
+        [btn("📊 Стата промо", "admin_promo_stats", style="primary", icon=EI_STAR),
+         btn("🗑 Удалить промо", "admin_delete_promo", style="danger", icon=EI_WARN)],
+        [btn("📋 Все логи (30)", "admin_total_logs", style="primary", icon=EI_LIKE)],
         [btn("🔙  Меню", "main_menu", icon=EI_STAR)])
 
 def back_kb():
     return kb([btn("🔙  Меню", "main_menu", icon=EI_STAR)])
 
+def commands_menu_kb():
+    """Меню с готовыми командами (слева от сообщений)."""
+    return kb(
+        [btn("💰 Баланс", "cmd_balance", style="success", icon=EI_OK),
+         btn("🎁 Бонус", "cmd_bonus", style="success", icon=EI_OK)],
+        [btn("🎮 Игры", "cmd_games", style="primary", icon=EI_LIKE),
+         btn("👥 Реф", "cmd_ref", style="primary", icon=EI_LIKE)],
+        [btn("🏢 Бизнесы", "cmd_businesses", style="primary", icon=EI_STAR),
+         btn("🎟️ Промо", "cmd_promo", style="primary", icon=EI_STAR)],
+        [btn("🏆 Топ", "cmd_top", style="primary", icon=EI_LIKE),
+         btn("📊 Стата", "cmd_stats", style="primary", icon=EI_LIKE)],
+        [btn("🛒 Магазин", "cmd_shop", style="success", icon=EI_OK)])
 def cancel_kb():
     return kb([btn("❌  Отмена", "cancel_fsm", style="danger", icon=EI_WARN)])
 
@@ -1075,6 +1283,11 @@ async def captcha_cb(cb: CallbackQuery):
 async def main_menu_cb(cb: CallbackQuery, state: FSMContext):
     await state.clear()
     uid = str(cb.from_user.id)
+
+    # Проверка устаревания кнопок
+    if await check_button_expiry(cb.message.chat.id, cb.message.message_id):
+        await cb.answer("⌛ Кнопки устарели!"); return
+
     db = load_db(); user = get_user(db, uid, cb.from_user.first_name, cb.from_user.username or "")
 
     if user.get("banned"): await cb.answer("🚫 Бан!", show_alert=True); return
@@ -1089,7 +1302,19 @@ async def main_menu_cb(cb: CallbackQuery, state: FSMContext):
     await edit_msg(cb.message.chat.id, cb.message.message_id,
         main_menu_text(cb.from_user.first_name, user),
         main_menu_kb(is_admin=(uid == ADMIN_ID)))
+    # Отмечаем кнопки для отслеживания устаревания
+    mark_button_expiry(cb.message.chat.id, cb.message.message_id)
     await cb.answer()
+
+# ─── COMMANDS PANEL (левое меню) ────────────────────────────────────────────
+@dp.callback_query(F.data == "open_commands")
+async def open_commands_cb(cb: CallbackQuery):
+    await cb.answer()
+    r = await send_msg(cb.message.chat.id,
+        "⚡ <b>БЫСТРЫЕ КОМАНДЫ</b>\n\n<i>Нажми на кнопку:</i>",
+        commands_menu_kb())
+    if r.get("result"):
+        mark_button_expiry(cb.message.chat.id, r["result"]["message_id"])
 
 # ─── CATEGORY CALLBACKS ─────────────────────────────────────────────────────
 @dp.callback_query(F.data == "cat_games")
@@ -1101,6 +1326,7 @@ async def cat_games_cb(cb: CallbackQuery):
         f"⚽ Футбол x2 | 🏀 Баскетбол x2 | 🎯 Дартс\n"
         f"💣 Мины | 📈 Краш | 🃏 21 Очко\n"
         f"🎰 Слоты | 🏆 Золото\n"
+        f"🤿 Дайвинг | 🔫 Русская Рулетка | 🎫 Золотой Билет\n"
         f"⚔️ Дуэль — /duel @user ставка", games_kb())
     await cb.answer()
 
@@ -1863,6 +2089,48 @@ async def admin_business_action_cb(cb: CallbackQuery, state: FSMContext):
     await edit_msg(cb.message.chat.id, cb.message.message_id, text_done, admin_kb())
     await cb.answer("✅ Готово")
 
+# ─── NEW ADMIN: PROMO STATS ─────────────────────────────────────────────────
+@dp.callback_query(F.data == "admin_promo_stats")
+async def admin_promo_stats_cb(cb: CallbackQuery, state: FSMContext):
+    if not admin_only(cb): return
+    await state.set_state(AdminStates.promo_code)
+    await state.update_data(admin_action="promo_stats")
+    await edit_msg(cb.message.chat.id, cb.message.message_id,
+        "📊 <b>Статистика промокода</b>\n\nВведи код промокода:", cancel_kb())
+    await cb.answer()
+
+# ─── NEW ADMIN: DELETE PROMO ────────────────────────────────────────────────
+@dp.callback_query(F.data == "admin_delete_promo")
+async def admin_delete_promo_cb(cb: CallbackQuery, state: FSMContext):
+    if not admin_only(cb): return
+    await state.set_state(AdminStates.promo_code)
+    await state.update_data(admin_action="delete_promo")
+    await edit_msg(cb.message.chat.id, cb.message.message_id,
+        "🗑 <b>Удалить промокод</b>\n\nВведи код для удаления:", cancel_kb())
+    await cb.answer()
+
+# ─── NEW ADMIN: TOTAL LOGS (LAST 30) ────────────────────────────────────────
+@dp.callback_query(F.data == "admin_total_logs")
+async def admin_total_logs_cb(cb: CallbackQuery):
+    if not admin_only(cb): return
+    db = load_db()
+    all_logs = []
+    for uid, u in db.items():
+        if not u.get("verified"): continue
+        name = u.get("name", "—")
+        for l in u.get("user_logs", []):
+            all_logs.append((l.get("time", ""), uid, name, l.get("action", ""), l.get("detail", "")))
+    all_logs.sort(key=lambda x: x[0], reverse=True)
+    lines = ["📋 <b>ПОСЛЕДНИЕ 30 ЛОГОВ (ВСЕ)</b>\n"]
+    if not all_logs:
+        lines.append("Пусто.")
+    else:
+        for i, (t, uid, name, act, det) in enumerate(all_logs[:30]):
+            lines.append(f"{i+1}. [{t}] <b>{safe(name)}</b> — {act} {det}")
+    await edit_msg(cb.message.chat.id, cb.message.message_id,
+        "\n".join(lines), admin_kb())
+    await cb.answer()
+
 @dp.callback_query(F.data == "admin_reset")
 async def admin_reset_cb(cb: CallbackQuery, state: FSMContext):
     if not admin_only(cb): return
@@ -1921,9 +2189,20 @@ async def admin_target_id(msg: Message, state: FSMContext):
 @dp.message(AdminStates.amount)
 async def admin_amount_msg(msg: Message, state: FSMContext):
     if str(msg.from_user.id) != ADMIN_ID: await state.clear(); return
+    data = await state.get_data()
+    # Проверка: это golden ticket custom bet?
+    if data.get("admin_action") == "golden_ticket":
+        amount = parse_amount(msg.text.strip())
+        if not amount or amount <= 0:
+            await send_msg(msg.chat.id, "❌ Неверная сумма!", cancel_kb()); return
+        await state.clear()
+        fake_cb = type("FakeCb", (), {})()
+        fake_cb.message = msg; fake_cb.from_user = msg.from_user
+        await process_golden_ticket_bet(fake_cb, amount)
+        return
     amount = parse_amount(msg.text.strip())
     if not amount: await send_msg(msg.chat.id, "❌ Неверная сумма!", cancel_kb()); return
-    data = await state.get_data(); action = data["action"]; tid = data["target_id"]
+    action = data["action"]; tid = data["target_id"]
     db = load_db(); tname = db.get(tid, {}).get("name", "—")
     if action == "give":
         if tid in db: db[tid]["balance"] = db[tid].get("balance", 0) + amount
@@ -1938,7 +2217,65 @@ async def admin_amount_msg(msg: Message, state: FSMContext):
 @dp.message(AdminStates.promo_code)
 async def admin_promo_code_msg(msg: Message, state: FSMContext):
     if str(msg.from_user.id) != ADMIN_ID: await state.clear(); return
+    data = await state.get_data()
+    admin_action = data.get("admin_action", "")
     code = msg.text.strip().upper()
+
+    # ── ПРОМО СТАТИСТИКА ──
+    if admin_action == "promo_stats":
+        promos = load_promos()
+        if code in promos.get("admin", {}):
+            p = promos["admin"][code]
+            created = p.get("created", "?"); limit = p.get("limit", 0); used = p.get("used", 0)
+            await state.clear()
+            await send_msg(msg.chat.id,
+                f"📊 <b>Статистика промокода</b>\n\n"
+                f"🎟️ <code>{code}</code>\n"
+                f"👑 Тип: <b>Админский</b>\n"
+                f"💰 Награда: <code>{fmt(p['amount'])}</code>\n"
+                f"📅 Создан: <b>{created}</b>\n"
+                f"👥 Активаций: <b>{used}</b>/<b>{limit}</b>", admin_kb())
+        elif code in promos.get("user", {}):
+            p = promos["user"][code]
+            creator_id = p.get("creator_id", "?")
+            acts = len(p.get("activated_by", []))
+            db = load_db(); creator_name = db.get(creator_id, {}).get("name", "?")
+            await state.clear()
+            await send_msg(msg.chat.id,
+                f"📊 <b>Статистика промокода</b>\n\n"
+                f"🎟️ <code>{code}</code>\n"
+                f"👤 Тип: <b>Пользовательский</b>\n"
+                f"👑 Создатель: <b>{safe(creator_name)}</b> (<code>{creator_id}</code>)\n"
+                f"👥 Активаций: <b>{acts}</b>", admin_kb())
+        else:
+            await send_msg(msg.chat.id, "❌ Промокод не найден!", cancel_kb())
+        return
+
+    # ── УДАЛИТЬ ПРОМО ──
+    if admin_action == "delete_promo":
+        promos = load_promos()
+        deleted = False
+        if code in promos.get("admin", {}):
+            del promos["admin"][code]; deleted = True
+        elif code in promos.get("user", {}):
+            creator_id = promos["user"][code].get("creator_id")
+            del promos["user"][code]
+            # Очищаем created_promo у создателя
+            if creator_id:
+                db = load_db()
+                if creator_id in db and db[creator_id].get("created_promo") == code:
+                    db[creator_id]["created_promo"] = None
+                    save_db(db)
+            deleted = True
+        if deleted:
+            save_promos(promos); await state.clear()
+            await send_msg(msg.chat.id,
+                f"🗑 <b>Промокод удалён!</b>\n\n🎟️ <code>{code}</code>", admin_kb())
+        else:
+            await send_msg(msg.chat.id, "❌ Промокод не найден!", cancel_kb())
+        return
+
+    # ── СОЗДАТЬ ПРОМО (default) ──
     if len(code) < 3 or len(code) > 15 or not code.isalnum():
         await send_msg(msg.chat.id, "❌ 3-15, латиница+цифры!", cancel_kb()); return
     promos = load_promos()
@@ -2470,7 +2807,240 @@ async def gold_cashout_cb(cb: CallbackQuery):
         f"✅ <b>Забрал золото!</b>\n\nУровень: <b>{level}</b>/12\nВыплата: <code>{fmt(payout)}</code> (x{mult:.2f})\n\n💰 <code>{fmt(new_bal)}</code>", game_nav_kb("game_gold"))
     await cb.answer("💰 Забрал!")
 
-# 💣 МИНЫ
+# 🤿 ДАЙВИНГ
+@dp.callback_query(F.data == "game_diving")
+async def game_diving_cb(cb: CallbackQuery):
+    uid = str(cb.from_user.id)
+    db = load_db(); user = get_user(db, uid, cb.from_user.first_name, cb.from_user.username or "")
+    if user.get("banned"):
+        await cb.answer("🚫 Бан!", show_alert=True); return
+    # Проверка кулдауна
+    now = int(time.time())
+    last_dive = user.get("last_dive", 0)
+    if now - last_dive < DIVING_COOLDOWN:
+        remaining = DIVING_COOLDOWN - (now - last_dive)
+        mins = remaining // 60; secs = remaining % 60
+        await edit_msg(cb.message.chat.id, cb.message.message_id,
+            f"🤿 <b>Дайвинг</b>\n\n"
+            f"⏳ Подожди <b>{mins}м {secs}с</b> до следующего погружения.\n\n"
+            f"💰 <code>{fmt(user['balance'])}</code>",
+            game_nav_kb("game_diving"))
+        await cb.answer(); return
+    save_db(db); await cb.answer("🤿 Ныряем!")
+    await edit_msg(cb.message.chat.id, cb.message.message_id,
+        f"🤿 <b>Дайвинг</b>\n\n<b>Погружаемся...</b> 🔍")
+    await asyncio.sleep(3.0)
+    # Определяем приз
+    prizes_flat = []
+    for amount, weight in DIVING_PRIZES:
+        prizes_flat.extend([amount] * weight)
+    prize = random.choice(prizes_flat)
+    # Атомарно начисляем
+    new_bal = apply_balance_delta(uid, delta_balance=prize,
+        log_action="diving", log_detail=f"+{fmt(prize)}")
+    # Обновляем last_dive
+    db2 = load_db()
+    if uid in db2:
+        db2[uid]["last_dive"] = now
+        save_db(db2)
+    await edit_msg(cb.message.chat.id, cb.message.message_id,
+        f"🤿 <b>Дайвинг</b>\n\n"
+        f"{ae('🎉', EI_OK)} Найдено: <code>{fmt(prize)}</code>\n\n"
+        f"💰 Баланс: <code>{fmt(new_bal)}</code>\n"
+        f"⏳ Следующее погружение через 30 минут.",
+        game_nav_kb("game_diving"))
+
+# 🔫 РУССКАЯ РУЛЕТКА
+def russian_roulette_kb():
+    rows = []
+    for i in range(0, 9, 3):
+        rows.append([btn(f"🔢 {j}", f"rr_num_{j}", style="primary", icon=EI_STAR) for j in range(i+1, i+4)])
+    rows.append([btn("🎲 Рандом", "rr_random", style="danger", icon=EI_WARN)])
+    rows.append([btn("🔙 Игры", "cat_games", style="primary", icon=EI_STAR)])
+    return {"inline_keyboard": rows}
+
+@dp.callback_query(F.data == "game_russian_roulette")
+async def game_russian_roulette_cb(cb: CallbackQuery):
+    uid = str(cb.from_user.id)
+    db = load_db(); user = get_user(db, uid, cb.from_user.first_name, cb.from_user.username or "")
+    if user.get("banned"):
+        await cb.answer("🚫 Бан!", show_alert=True); return
+    bal = user.get("balance", 0)
+    if bal <= 0:
+        await cb.answer("❌ У тебя 0 на балансе!", show_alert=True); return
+    save_db(db)
+    await edit_msg(cb.message.chat.id, cb.message.message_id,
+        f"{ae('🔫', EI_WARN)} <b>РУССКАЯ РУЛЕТКА</b>\n\n"
+        f"⚡ <b>ВСЁ или НИЧЕГО!</b>\n\n"
+        f"💰 Твой баланс: <code>{fmt(bal)}</code>\n\n"
+        f"Угадай число от <b>1 до 9</b>. Если угадаешь — баланс x1.05!\n"
+        f"Если нет — теряешь ВСЁ.\n"
+        f"<i>Выстрела может не произойти — повезёт!</i>",
+        russian_roulette_kb())
+
+@dp.callback_query(F.data.startswith("rr_num_"))
+async def russian_roulette_num_cb(cb: CallbackQuery):
+    uid = str(cb.from_user.id)
+    chosen = int(cb.data.split("_")[2])
+    await play_russian_roulette(cb, uid, chosen)
+
+@dp.callback_query(F.data == "rr_random")
+async def russian_roulette_random_cb(cb: CallbackQuery):
+    uid = str(cb.from_user.id)
+    chosen = random.randint(1, 9)
+    await cb.answer(f"🎲 Выбрано: {chosen}")
+    await play_russian_roulette(cb, uid, chosen)
+
+_rr_locks = set()
+
+async def play_russian_roulette(cb, uid, chosen):
+    if uid in _rr_locks:
+        await cb.answer("⏳ Подожди...", show_alert=True); return
+    _rr_locks.add(uid)
+    try:
+        db = load_db()
+        user = get_user(db, uid, cb.from_user.first_name, cb.from_user.username or "")
+        bal = user.get("balance", 0)
+        if bal <= 0:
+            await edit_msg(cb.message.chat.id, cb.message.message_id,
+                "❌ У тебя 0 на балансе!", back_kb()); return
+        # Забираем ВСЁ
+        bet = bal
+        apply_balance_delta(uid, delta_balance=-bet,
+            log_action="russian_roulette_bet", log_detail=f"ставка ВСЁ {fmt(bet)}")
+
+        await edit_msg(cb.message.chat.id, cb.message.message_id,
+            f"🔫 <b>Русская Рулетка</b>\n\n"
+            f"🎯 Твой выбор: <b>{chosen}</b>\n"
+            f"💰 Ставка: <code>{fmt(bet)}</code>\n\n"
+            f"<b>Вращаем барабан...</b>")
+        await asyncio.sleep(2.5)
+
+        # 1 из 9 шанс выиграть + 1 из 9 шанс что выстрела не будет
+        bullet = random.randint(1, 9)
+        dud_chance = random.randint(0, 8)  # 1 из 9 что осечка
+
+        if dud_chance == 0:
+            # Осечка! Возвращаем деньги
+            new_bal = apply_balance_delta(uid, delta_balance=bet, delta_wins=1,
+                log_action="russian_roulette_dud", log_detail=f"осечка! возврат {fmt(bet)}")
+            result = f"{ae('😅', EI_OK)} <b>ОСЕЧКА!</b>\nВыстрела не произошло!\nСтавка возвращена: <code>{fmt(bet)}</code>"
+        elif chosen == bullet:
+            # ВЫИГРЫШ!
+            payout = int(bet * 1.05)
+            new_bal = apply_balance_delta(uid, delta_balance=payout, delta_wins=1,
+                log_action="russian_roulette_win", log_detail=f"x1.05 payout={fmt(payout)}")
+            result = f"{ae('🎉', EI_OK)} <b>ВЫИГРАЛ!</b>\n\nВыплата x1.05: <code>{fmt(payout)}</code>"
+        else:
+            # ПРОИГРЫШ
+            new_bal = apply_balance_delta(uid, delta_losses=1,
+                log_action="russian_roulette_loss", log_detail=f"потерял ВСЁ {fmt(bet)}")
+            add_business_loss_income(bet)
+            result = f"{ae('💀', EI_WARN)} <b>ПРОИГРАЛ!</b>\n\nТы потерял: <code>{fmt(bet)}</code>"
+        await edit_msg(cb.message.chat.id, cb.message.message_id,
+            f"🔫 <b>Русская Рулетка — Результат</b>\n\n"
+            f"🎯 Твой выбор: <b>{chosen}</b>\n"
+            f"💥 Пуля была в: <b>{bullet}</b>\n\n"
+            f"{result}\n\n"
+            f"💰 Баланс: <code>{fmt(new_bal)}</code>",
+            game_nav_kb("game_russian_roulette"))
+    finally:
+        _rr_locks.discard(uid)
+
+# 🎫 ЗОЛОТОЙ БИЛЕТ
+@dp.callback_query(F.data == "game_golden_ticket")
+async def game_golden_ticket_cb(cb: CallbackQuery):
+    uid = str(cb.from_user.id)
+    gt = load_golden_ticket()
+    now = int(time.time())
+    next_ts = gt.get("next_game_ts", 0)
+    bank = gt.get("bank", 0)
+    players = gt.get("players", {})
+    my_bet = players.get(uid, 0)
+
+    if next_ts <= 0 or next_ts < now:
+        await edit_msg(cb.message.chat.id, cb.message.message_id,
+            f"🎫 <b>Золотой Билет</b>\n\n"
+            f"Сейчас нет активной игры.\n"
+            f"Игра проходит раз в день. Ожидайте объявления!",
+            game_nav_kb("game_golden_ticket"))
+        await cb.answer(); return
+
+    remaining = next_ts - now
+    mins = remaining // 60; secs = remaining % 60
+
+    await edit_msg(cb.message.chat.id, cb.message.message_id,
+        f"🎫 <b>ЗОЛОТОЙ БИЛЕТ</b>\n\n"
+        f"💰 Банк игры: <code>{fmt(bank)}</code>\n"
+        f"👥 Участников: <b>{len(players)}</b>\n"
+        f"💵 Твоя ставка: <code>{fmt(my_bet)}</code>\n\n"
+        f"⏳ До розыгрыша: <b>{mins}м {secs}с</b>\n\n"
+        f"<i>Поставь сумму — через час случайный победитель заберёт ВСЁ!</i>",
+        golden_ticket_kb(uid, gt))
+
+def golden_ticket_kb(uid, gt):
+    rows = [
+        [btn("💵 500.000", "gt_bet_500000", style="success", icon=EI_OK),
+         btn("💵 1.000.000", "gt_bet_1000000", style="success", icon=EI_OK)],
+        [btn("💵 5.000.000", "gt_bet_5000000", style="primary", icon=EI_STAR),
+         btn("💵 10.000.000", "gt_bet_10000000", style="primary", icon=EI_STAR)],
+        [btn("✍️ Своя сумма", "gt_custom_bet", style="primary", icon=EI_LIKE)],
+    ]
+    rows.append([btn("🔄 Обновить", "game_golden_ticket", style="primary", icon=EI_LIKE),
+                 btn("🔙 Игры", "cat_games", style="primary", icon=EI_STAR)])
+    return {"inline_keyboard": rows}
+
+@dp.callback_query(F.data.startswith("gt_bet_"))
+async def golden_ticket_bet_cb(cb: CallbackQuery):
+    amount = int(cb.data.split("_")[2])
+    await process_golden_ticket_bet(cb, amount)
+
+@dp.callback_query(F.data == "gt_custom_bet")
+async def golden_ticket_custom_cb(cb: CallbackQuery, state: FSMContext):
+    uid = str(cb.from_user.id)
+    await state.set_state(AdminStates.amount)
+    await state.update_data(admin_action="golden_ticket", target_id=uid, action="golden_ticket")
+    await edit_msg(cb.message.chat.id, cb.message.message_id,
+        "🎫 <b>Золотой Билет — Своя ставка</b>\n\nВведи сумму:", cancel_kb())
+    await cb.answer()
+
+_gt_locks = set()
+
+async def process_golden_ticket_bet(cb, amount):
+    uid = str(cb.from_user.id)
+    if uid in _gt_locks:
+        await cb.answer("⏳ Подожди...", show_alert=True); return
+    _gt_locks.add(uid)
+    try:
+        gt = load_golden_ticket()
+        now = int(time.time())
+        if gt.get("next_game_ts", 0) < now:
+            await cb.answer("❌ Игра уже завершена!", show_alert=True); return
+        db = load_db()
+        user = get_user(db, uid, cb.from_user.first_name, cb.from_user.username or "")
+        if user["balance"] < amount:
+            await cb.answer("❌ Недостаточно средств!", show_alert=True); return
+        # Списываем
+        apply_balance_delta(uid, delta_balance=-amount,
+            log_action="golden_ticket_bet", log_detail=f"-{fmt(amount)}")
+        # Добавляем в банк
+        gt["bank"] = gt.get("bank", 0) + amount
+        gt["players"][uid] = gt["players"].get(uid, 0) + amount
+        save_golden_ticket(gt)
+        await cb.answer(f"✅ Ставка {fmt(amount)} принята!")
+        bank = gt["bank"]; players = gt["players"]
+        remaining = gt["next_game_ts"] - now
+        mins = remaining // 60; secs = remaining % 60
+        await edit_msg(cb.message.chat.id, cb.message.message_id,
+            f"🎫 <b>ЗОЛОТОЙ БИЛЕТ</b>\n\n"
+            f"✅ Ставка принята: <code>{fmt(amount)}</code>\n\n"
+            f"💰 Банк игры: <code>{fmt(bank)}</code>\n"
+            f"👥 Участников: <b>{len(players)}</b>\n"
+            f"💵 Твоя ставка: <code>{fmt(players.get(uid, 0))}</code>\n\n"
+            f"⏳ До розыгрыша: <b>{mins}м {secs}с</b>",
+            golden_ticket_kb(uid, gt))
+    finally:
+        _gt_locks.discard(uid)
 MINES_GRID = 16
 MINES_OPTIONS = [2, 3, 4, 5, 6, 8, 10, 12]
 # Чем больше мин, тем быстрее растёт множитель за каждую открытую безопасную клетку.
@@ -2633,6 +3203,73 @@ async def mines_cashout_cb(cb: CallbackQuery):
 @dp.callback_query(F.data == "noop")
 async def noop_cb(cb: CallbackQuery): await cb.answer()
 
+# ─── COMMANDS MENU CALLBACKS ─────────────────────────────────────────────────
+@dp.callback_query(F.data == "cmd_balance")
+async def cmd_balance_cb(cb: CallbackQuery):
+    db = load_db(); uid = str(cb.from_user.id)
+    user = get_user(db, uid, cb.from_user.first_name, cb.from_user.username or ""); save_db(db)
+    await cb.answer()
+    await send_msg(cb.message.chat.id, f"💰 <b>Баланс:</b> <code>{fmt(user['balance'])}</code>")
+
+@dp.callback_query(F.data == "cmd_bonus")
+async def cmd_bonus_cb(cb: CallbackQuery):
+    db = load_db(); uid = str(cb.from_user.id)
+    user = get_user(db, uid, cb.from_user.first_name, cb.from_user.username or "")
+    today = str(date.today())
+    if user["last_bonus"] == today:
+        await cb.answer("✅ Уже получен!", show_alert=True); return
+    user["balance"] += 1_000_000; user["last_bonus"] = today
+    add_log(db, uid, "bonus", "+$1.000.000"); save_db(db)
+    await cb.answer("🎁 +$1.000.000!")
+    await send_msg(cb.message.chat.id, f"🎁 <b>Бонус!</b>\n\n+<b>$1.000.000</b>\n💰 <code>{fmt(user['balance'])}</code>")
+
+@dp.callback_query(F.data == "cmd_games")
+async def cmd_games_cb(cb: CallbackQuery):
+    await cb.answer()
+    await send_msg(cb.message.chat.id,
+        "🎮 <b>ИГРЫ</b>\n\n⚽ Футбол | 🏀 Баскетбол | 🎯 Дартс\n💣 Мины | 📈 Краш | 🃏 21 Очко\n🎰 Слоты | 🏆 Золото | 🤿 Дайвинг\n🔫 Рулетка | 🎫 Золотой Билет\n⚔️ /duel @user ставка", games_kb())
+
+@dp.callback_query(F.data == "cmd_ref")
+async def cmd_ref_cb(cb: CallbackQuery):
+    db = load_db(); uid = str(cb.from_user.id)
+    user = get_user(db, uid, cb.from_user.first_name, cb.from_user.username or ""); save_db(db)
+    me = await bot.get_me(); link = f"https://t.me/{me.username}?start=ref_{uid}"
+    await cb.answer()
+    await send_msg(cb.message.chat.id,
+        f"👥 <b>Рефералы</b>\n\nДрузей: <b>{len(user['referrals'])}</b>\n🔗 <code>{link}</code>")
+
+@dp.callback_query(F.data == "cmd_businesses")
+async def cmd_businesses_cb(cb: CallbackQuery):
+    uid = str(cb.from_user.id)
+    await cb.answer()
+    await send_msg(cb.message.chat.id, businesses_text(uid), businesses_kb(uid))
+
+@dp.callback_query(F.data == "cmd_promo")
+async def cmd_promo_cb(cb: CallbackQuery):
+    await cb.answer()
+    await send_msg(cb.message.chat.id,
+        "🎟️ <b>ПРОМОКОДЫ</b>\n\n🎟️ Ввести | 👤 Пользовательский\n➕ Создать | 📋 Мой", promo_kb())
+
+@dp.callback_query(F.data == "cmd_top")
+async def cmd_top_cb(cb: CallbackQuery):
+    await cb.answer()
+    await send_msg(cb.message.chat.id, "🏆 <b>РЕЙТИНГ</b>\n\n💰 Баланс | 🏆 Победы | 💀 Поражения", rating_kb())
+
+@dp.callback_query(F.data == "cmd_stats")
+async def cmd_stats_cb(cb: CallbackQuery):
+    db = load_db(); uid = str(cb.from_user.id)
+    user = get_user(db, uid, cb.from_user.first_name, cb.from_user.username or ""); save_db(db)
+    s = user["stats"]; total = sum(s.values())
+    await cb.answer()
+    await send_msg(cb.message.chat.id,
+        f"📊 <b>Статистика</b>\n\n🎮 <b>{total}</b>\n🏆 <b>{s['wins']}</b>\n💀 <b>{s['losses']}</b>\n🤝 <b>{s['draws']}</b>")
+
+@dp.callback_query(F.data == "cmd_shop")
+async def cmd_shop_cb(cb: CallbackQuery):
+    await cb.answer()
+    await send_msg(cb.message.chat.id,
+        f"🛒 <b>МАГАЗИН</b>\n\nКурс: <b>1 ⭐ = {fmt(SHOP_RATE_PER_STAR)}</b>", shop_kb())
+
 # ─── UNKNOWN COMMAND ─────────────────────────────────────────────────────────
 @dp.message(F.text.startswith("/"))
 async def unknown_cmd(msg: Message):
@@ -2641,6 +3278,9 @@ async def unknown_cmd(msg: Message):
 # ─── MAIN ────────────────────────────────────────────────────────────────────
 async def main():
     print("🎮 gamGems запущен!")
+    # Запуск фоновых задач
+    asyncio.create_task(tax_daily_loop())
+    asyncio.create_task(golden_ticket_daily_loop())
     await dp.start_polling(bot, skip_updates=True)
 
 if __name__ == "__main__":
